@@ -8,6 +8,8 @@ import pandas as pd
 import psycopg2
 from psycopg2 import sql
 
+from src.spell_corrector import normalize_query, build_enriched_query
+
 from langchain_core.messages import HumanMessage
 from langchain_core.prompts import PromptTemplate, ChatPromptTemplate
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough
@@ -77,12 +79,29 @@ def sql_query_tool(query: str) -> List[dict]:
 
 # --- LLM Chains for Classification and SQL Generation ---
 input_classifier_prompt = PromptTemplate.from_template(
-    """You are an expert in classifying customer queries for an airline support system.\n    Classify the following user query into one of these categories:\n    'Need SQL', 'Non SQL', or 'Out of Context'.\n\n    'Need SQL' is for queries that require fetching real-time flight data from a PostgreSQL database.\n    'Non SQL' is for queries related to airline policies or FAQs that can be answered by a RAG agent.\n    'Out of Context' is for queries unrelated to airline support.\n\n    Query: {query}\n\n    Classification:"""
+    """You are an expert in classifying customer queries for an airline support system.
+Classify the following user query into one of these categories:
+'Need SQL', 'Non SQL', or 'Out of Context'.
+
+Guidelines for classification:
+- 'Need SQL' is for queries that require fetching real-time flight data (flight schedules, availability, status, delays, bookings, fares)
+- 'Non SQL' is for queries about airline policies, procedures, FAQs, or general information
+- 'Out of Context' is for queries completely unrelated to airline support
+
+Even if the query contains misspellings, typos, or grammatical errors, classify based on the intent.
+Be lenient and assume the best interpretation of the user's intent.
+
+Query: {query}
+
+Classification:"""
 )
 input_classifier_chain = input_classifier_prompt | llm
 
 sql_query_generation_prompt = ChatPromptTemplate.from_messages([
-    ("system", """You are a PostgreSQL expert. Based on the table schema below, write a PostgreSQL query that would answer the user's question.\n    flights table schema:\n    | Column Name    | Data Type | Description                                            |\n    | -------------- | --------- | ------------------------------------------------------ |\n    | id             | BIGINT    | Unique identifier for each flight record (Primary Key) |\n    | flight_no      | TEXT      | Flight number (e.g., AI695, SG528)                     |\n    | airline_code   | TEXT      | Airline code (e.g., AI, SG, IX)                        |\n    | airline_name   | TEXT      | Full airline name                                      |\n    | origin         | TEXT      | Origin airport code                                    |\n    | destination    | TEXT      | Destination airport code                               |\n    | departure_date | DATE      | Scheduled departure date                               |\n    | departure_time | TIME       | Scheduled departure time                               |\n    | arrival_date   | DATE      | Scheduled arrival date                                 |\n    | arrival_time | TIME      | Scheduled arrival time                                 |\n    | status         | TEXT      | Current flight status (On Time, Delayed, Cancelled)    |\n    | delay_minutes  | INTEGER   | Delay duration in minutes                              |\n    | delay_reason   | TEXT      | Reason for delay, if applicable                        |\n    | terminal       | TEXT      | Departure terminal                                     |\n    | gate           | TEXT      | Departure gate number                                  |\n    | aircraft_type  | TEXT      | Aircraft model used for the flight                     |\n    | seats_total    | INTEGER   | Total number of seats available                        |\n    | seats_booked   | INTEGER   | Number of seats already booked                         |\n    | fare_inr       | INTEGER   | Ticket fare in Indian Rupees                           |\n\n    Always include the `WHERE` clause if there are specific conditions mentioned in the user's question.\n    Ensure the queries are read-only and do not contain any `UPDATE`, `DELETE`, `INSERT`, or `DROP` statements.\n    Also, for text values, use single quotes (e.g., 'value').\n\n    Example: 'What is the status of flight 6E815?'\n    Generated SQL: SELECT status FROM flights WHERE flight_no = '6E815';\n
+    ("system", """You are a PostgreSQL expert for an airline system. Your task is to generate accurate SQL queries.
+
+TABLE SCHEMA:
+flights table with the following structure:\n    | Column Name    | Data Type | Description                                            |\n    | -------------- | --------- | ------------------------------------------------------ |\n    | id             | BIGINT    | Unique identifier for each flight record (Primary Key) |\n    | flight_no      | TEXT      | Flight number (e.g., AI695, SG528)                     |\n    | airline_code   | TEXT      | Airline code (e.g., AI, SG, IX)                        |\n    | airline_name   | TEXT      | Full airline name                                      |\n    | origin         | TEXT      | Origin airport code                                    |\n    | destination    | TEXT      | Destination airport code                               |\n    | departure_date | DATE      | Scheduled departure date                               |\n    | departure_time | TIME       | Scheduled departure time                               |\n    | arrival_date   | DATE      | Scheduled arrival date                                 |\n    | arrival_time | TIME      | Scheduled arrival time                                 |\n    | status         | TEXT      | Current flight status (On Time, Delayed, Cancelled)    |\n    | delay_minutes  | INTEGER   | Delay duration in minutes                              |\n    | delay_reason   | TEXT      | Reason for delay, if applicable                        |\n    | terminal       | TEXT      | Departure terminal                                     |\n    | gate           | TEXT      | Departure gate number                                  |\n    | aircraft_type  | TEXT      | Aircraft model used for the flight                     |\n    | seats_total    | INTEGER   | Total number of seats available                        |\n    | seats_booked   | INTEGER   | Number of seats already booked                         |\n    | fare_inr       | INTEGER   | Ticket fare in Indian Rupees                           |\n\n    Always include the `WHERE` clause if there are specific conditions mentioned in the user's question.\n    Ensure the queries are read-only and do not contain any `UPDATE`, `DELETE`, `INSERT`, or `DROP` statements.\n    Also, for text values, use single quotes (e.g., 'value').\n\n    Example: 'What is the status of flight 6E815?'\n    Generated SQL: SELECT status FROM flights WHERE flight_no = '6E815';\n
     Example: 'Show available flights from Mumbai to Bengaluru.'\n    Generated SQL: SELECT * FROM flights WHERE origin = 'BOM' AND destination = 'BLR';\n
     Example: 'List flights from Delhi to Goa under ₹7000.'\n    Generated SQL: SELECT * FROM flights WHERE origin = 'DEL' AND destination = 'GOI' AND fare_inr < 7000;\n
     Example: 'Show flights delayed by more than 60 minutes.'\n    Generated SQL: SELECT * FROM flights WHERE delay_minutes > 60 AND status = 'Delayed';"""),
@@ -231,12 +250,20 @@ def process_user_query_with_guardrails(user_query: str) -> str:
     """Combines all components to process a user query, with added input and output guardrails."""
     print(f"\nProcessing user query with guardrails: {user_query}")
 
+    # 0. Normalize and correct the query
+    corrected_query, metadata = normalize_query(user_query)
+    enriched_query = build_enriched_query(user_query, metadata)
+    
+    print(f"Original query: {user_query}")
+    print(f"Corrected query: {corrected_query}")
+    print(f"Enriched query: {enriched_query}")
+
     # 1. Apply Input Guardrails
-    if not input_guardrail(user_query):
+    if not input_guardrail(corrected_query):
         return "I cannot process this query due to safety concerns or forbidden content. Please rephrase your request."
 
     # 2. Classify the query
-    classification_response = input_classifier_chain.invoke({'query': user_query})
+    classification_response = input_classifier_chain.invoke({'query': enriched_query})
     classification = classification_response.content.strip()
     print(f"Query classified as: {classification}")
 
@@ -244,7 +271,7 @@ def process_user_query_with_guardrails(user_query: str) -> str:
 
     if classification == 'Need SQL':
         print("Routing to SQL Agent...")
-        generated_sql_response = sql_query_generation_chain.invoke({'query': user_query})
+        generated_sql_response = sql_query_generation_chain.invoke({'query': enriched_query})
         generated_sql = generated_sql_response.content.strip()
         print(f"Generated SQL: {generated_sql}")
 
@@ -258,13 +285,13 @@ def process_user_query_with_guardrails(user_query: str) -> str:
 
     elif classification == 'Non SQL':
         print("Routing to RAG Chain...")
-        rag_output = rag_chain.invoke({"question": user_query})
+        rag_output = rag_chain.invoke({"question": enriched_query})
         final_response = rag_output['answer']
 
     elif classification == 'Out of Context':
         print("Routing to Out of Context handler...")
         fallback_response = llm.invoke(
-            f"Your query '{user_query}' is outside the scope of airline support. Can I help you with anything related to flights or airline policies?"
+            f"Your query '{enriched_query}' is outside the scope of airline support. Can I help you with anything related to flights or airline policies?"
         )
         final_response = fallback_response.content
 
