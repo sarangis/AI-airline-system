@@ -1,0 +1,17 @@
+langchain
+langchain-core
+langchain-community
+langchain-openai
+langchain-pinecone
+langchain-huggingface
+langchain-experimental
+langgraph
+pymupdf
+pandas
+psycopg2-binary
+scikit-learn # If you were using it for any part, though not explicitly in the final Colab code
+fastapi
+uvicorn
+streamlit
+requests
+sentence-transformers
