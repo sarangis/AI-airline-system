@@ -9,6 +9,7 @@ import psycopg2
 from psycopg2 import sql
 
 from src.spell_corrector import normalize_query, build_enriched_query
+from src.llm_spell_corrector import create_llm_spell_corrector, create_llm_query_enhancer, combine_corrections
 
 from langchain_core.messages import HumanMessage
 from langchain_core.prompts import PromptTemplate, ChatPromptTemplate
@@ -112,6 +113,10 @@ sql_query_generation_chain = sql_query_generation_prompt | llm
 # --- AI Agent for SQL Execution ---
 tools = [sql_query_tool]
 agent_executor = create_react_agent(llm, tools)
+
+# --- LLM-based Spell Corrector and Query Enhancer ---
+llm_spell_corrector = create_llm_spell_corrector(llm)
+llm_query_enhancer = create_llm_query_enhancer(llm)
 
 
 # --- RAG Setup (Pinecone) ---
@@ -250,20 +255,35 @@ def process_user_query_with_guardrails(user_query: str) -> str:
     """Combines all components to process a user query, with added input and output guardrails."""
     print(f"\nProcessing user query with guardrails: {user_query}")
 
-    # 0. Normalize and correct the query
-    corrected_query, metadata = normalize_query(user_query)
-    enriched_query = build_enriched_query(user_query, metadata)
+    # 0a. Fuzzy matching-based normalization
+    fuzzy_corrected, fuzzy_metadata = normalize_query(user_query)
+    
+    # 0b. LLM-based spell correction (more intelligent)
+    llm_correction_result = llm_spell_corrector(user_query)
+    llm_corrected_query = llm_correction_result.get('corrected_query', user_query)
+    
+    # Combine both approaches
+    final_corrected = combine_corrections(user_query, fuzzy_corrected, llm_correction_result)
+    enriched_query = build_enriched_query(user_query, fuzzy_metadata)
+    
+    # 0c. Optional: Enhance query further
+    enhancement_result = llm_query_enhancer(final_corrected)
+    enhanced_query = enhancement_result.get('enhanced_query', final_corrected)
     
     print(f"Original query: {user_query}")
-    print(f"Corrected query: {corrected_query}")
-    print(f"Enriched query: {enriched_query}")
+    print(f"Fuzzy corrected: {fuzzy_corrected}")
+    print(f"LLM corrected: {llm_corrected_query}")
+    print(f"Final corrected: {final_corrected}")
+    print(f"Enhanced query: {enhanced_query}")
+    if llm_correction_result.get('corrections'):
+        print(f"Corrections applied: {llm_correction_result['corrections']}")
 
     # 1. Apply Input Guardrails
-    if not input_guardrail(corrected_query):
+    if not input_guardrail(final_corrected):
         return "I cannot process this query due to safety concerns or forbidden content. Please rephrase your request."
 
     # 2. Classify the query
-    classification_response = input_classifier_chain.invoke({'query': enriched_query})
+    classification_response = input_classifier_chain.invoke({'query': enhanced_query})
     classification = classification_response.content.strip()
     print(f"Query classified as: {classification}")
 
@@ -271,7 +291,7 @@ def process_user_query_with_guardrails(user_query: str) -> str:
 
     if classification == 'Need SQL':
         print("Routing to SQL Agent...")
-        generated_sql_response = sql_query_generation_chain.invoke({'query': enriched_query})
+        generated_sql_response = sql_query_generation_chain.invoke({'query': enhanced_query})
         generated_sql = generated_sql_response.content.strip()
         print(f"Generated SQL: {generated_sql}")
 
@@ -285,13 +305,13 @@ def process_user_query_with_guardrails(user_query: str) -> str:
 
     elif classification == 'Non SQL':
         print("Routing to RAG Chain...")
-        rag_output = rag_chain.invoke({"question": enriched_query})
+        rag_output = rag_chain.invoke({"question": enhanced_query})
         final_response = rag_output['answer']
 
     elif classification == 'Out of Context':
         print("Routing to Out of Context handler...")
         fallback_response = llm.invoke(
-            f"Your query '{enriched_query}' is outside the scope of airline support. Can I help you with anything related to flights or airline policies?"
+            f"Your query '{enhanced_query}' is outside the scope of airline support. Can I help you with anything related to flights or airline policies?"
         )
         final_response = fallback_response.content
 
